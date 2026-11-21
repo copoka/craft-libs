@@ -13,10 +13,11 @@ The crate has three parts:
 | Kind | Direction | Fields | Meaning |
 |---|---|---|---|
 | `ready` | app → host | `version`, `appVersion?`, `file?` | the app can take a document; `file: true` means it reads a `File`/`Blob` in slices |
-| `host` | host → app | `version`, `handoff?` | what the host supports; `handoff: true` means it routes hand-offs |
+| `host` | host → app | `version`, `handoff?`, `confirmsSaves?` | what the host supports; `handoff: true` means it routes hand-offs, `confirmsSaves: true` that it answers every save |
 | `open` | host → app | `name`, and `bytes` or `file` + `size` | open a document as File › Open would |
 | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` | Save, Save As or Export: the host stores the file |
 | `saved` | host → app | `id` | the save with that `id` is stored; the app clears dirty |
+| `save-failed` | host → app | `id`, `error` | the host refused that save; `error` is free text to show as it came |
 | `dirty` | app → host | `dirty` | unsaved changes appeared or went away |
 | `failed` | app → host | `error`, `id?` | a document or a save could not be taken |
 | `handoff` | app → host | `name`, and `bytes` or `file` + `size` | this file belongs to another app |
@@ -27,6 +28,7 @@ With `?host=parent` a message is an object with `type` (`pdfcraft:open`) and the
 Compatibility with the bridges shipped before this crate:
 
 - Fields marked `?` are optional. A host answers `saved` only for a `save` that carries an `id`; an app that sends none treats its save as done once it is posted.
+- A host that sets `confirmsSaves: true` in `host` answers every save: the app puts an `id` in each `save` and keeps the document unsaved until `saved {id}` or `save-failed {id, error}`. The crate times an unanswered save out (30 s by default) and hands the app `SaveFailure::{Refused, TimedOut}` to word.
 - A host that never sends `host` gets the behaviour of the earlier bridges.
 - `size` beside `file` is for hosts and older bridges; this crate takes a `Blob`'s length from the `Blob` itself.
 - A page host may dispatch an event while the app's handler runs (a `saved` answering the `save` it just posted). The bridge holds it and calls the handler again once the running call returns, so messages arrive one at a time and in order.
@@ -56,12 +58,15 @@ The page command API is [`craft-web-api`](../web-api/README.md) (storytold/craft
 `status::HostStatus` takes one input per thing the app learns, in any order:
 
 ```rust
+use std::time::Duration;
 use craft_web_host::status::{HostStatus, SaveState, StatusInput};
 
 let mut status = HostStatus::new();
-status.apply(StatusInput::Edited); // a local change
-status.apply(StatusInput::SavePosted { id: Some("7") }); // the `save` it just posted
-status.apply(StatusInput::Saved { id: "7" }); // the host's `saved`
+let mut now = Duration::ZERO; // the app's monotonic clock, in any one unit
+status.apply(StatusInput::Edited, now); // a local change
+status.apply(StatusInput::SavePosted { id: Some("7") }, now); // the `save` it just posted
+now += Duration::from_secs(1);
+status.apply(StatusInput::Saved { id: "7" }, now); // the host's `saved`
 assert_eq!(status.save_state(), SaveState::Saved);
 
 // Each frame, the parts the title bar draws, in the order it draws them.
@@ -71,7 +76,7 @@ for part in status.cluster().parts() {
 }
 ```
 
-`cluster().parts()` leaves out what does not apply: no participant count without a session, no sync word while `synced`, no version before a commit. `cluster().error` is the reason a save was refused, for as long as the document shows as unsaved.
+`cluster().parts()` leaves out what does not apply: no participant count without a session, no sync word while `synced`, no version before a commit. `cluster().failure` is why a save is not stored, for as long as the document shows as unsaved: the host's `SaveFailure::Refused` text, shown as it came, or `SaveFailure::TimedOut` for the app to word. The timeout is [`DEFAULT_SAVE_TIMEOUT`] (30 s); `HostStatus::with_save_timeout` and `set_save_timeout` change it, and `Duration::ZERO` turns it off.
 
 ## One authority per document
 

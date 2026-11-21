@@ -7,18 +7,26 @@
 //! | Kind | Direction | Fields |
 //! |---|---|---|
 //! | `ready` | app → host | `version`, `appVersion?`, `file?` (`true`: it reads a `File`/`Blob` in slices) |
-//! | `host` | host → app | `version`, `handoff?` (`true`: the host routes hand-offs) |
+//! | `host` | host → app | `version`, `handoff?` (`true`: the host routes hand-offs), `confirmsSaves?` |
 //! | `open` | host → app | `name`, and `bytes` or `file` + `size` |
 //! | `attach-pdf` | host → app | `name`, `bytes`, `page` (from 1), `insertion` ([x,y,z]), `width`, `height` in drawing units |
 //! | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` |
 //! | `saved` | host → app | `id` |
+//! | `save-failed` | host → app | `id`, `error` |
 //! | `dirty` | app → host | `dirty` |
 //! | `failed` | app → host | `error`, `id?` |
 //! | `handoff` | app → host | `name`, and `bytes` or `file` + `size` |
 //! | `handoff-done` | host → app | `name`, `app` |
 //!
 //! A host answers `saved` only for a `save` that carries an `id`; an app that sends none treats a
-//! save as done once it is posted. Fields marked `?` are optional, so the bridges shipped before
+//! save as done once it is posted. A host that sets `confirmsSaves: true` in `host` confirms every
+//! save: the app puts an `id` in each `save` and keeps the document unsaved until `saved {id}` or
+//! `save-failed {id, error}`, whose `error` is free text to show as it is. [`status`] owns that
+//! bookkeeping, including a timeout for an unanswered save (30 s by default). A host that never says
+//! so keeps the behaviour of the earlier bridges, and `failed` stays app → host: a refusal of a save
+//! comes back as `save-failed`, never by reusing it.
+//!
+//! Fields marked `?` are optional, so the bridges shipped before
 //! this crate already speak version 1. Those bridges put the app's own release in `ready`'s
 //! `version` (`"0.14.0"`): a host treats any `version` it doesn't know as `"1"`.
 //!
@@ -89,6 +97,7 @@ pub enum Incoming {
     Open,
     AttachPdf,
     Saved,
+    SaveFailed,
     HandoffDone,
 }
 
@@ -105,7 +114,7 @@ impl Outgoing {
 }
 
 impl Incoming {
-    pub const ALL: [Self; 5] = [Self::Host, Self::Open, Self::AttachPdf, Self::Saved, Self::HandoffDone];
+    pub const ALL: [Self; 6] = [Self::Host, Self::Open, Self::AttachPdf, Self::Saved, Self::SaveFailed, Self::HandoffDone];
 
     pub const fn kind(self) -> &'static str {
         match self {
@@ -113,6 +122,7 @@ impl Incoming {
             Self::Open => "open",
             Self::AttachPdf => "attach-pdf",
             Self::Saved => "saved",
+            Self::SaveFailed => "save-failed",
             Self::HandoffDone => "handoff-done",
         }
     }
@@ -203,6 +213,7 @@ mod tests {
     fn only_this_apps_incoming_kinds_parse() {
         assert_eq!(Incoming::parse("pdfcraft", "pdfcraft:open"), Some(Incoming::Open));
         assert_eq!(Incoming::parse("pdfcraft", "pdfcraft:handoff-done"), Some(Incoming::HandoffDone));
+        assert_eq!(Incoming::parse("pdfcraft", "pdfcraft:save-failed"), Some(Incoming::SaveFailed));
         assert_eq!(Incoming::parse("pdfcraft", "cadcraft:open"), None, "another app's message");
         assert_eq!(Incoming::parse("pdfcraft", "pdfcraft:save"), None, "app-to-host kinds are not incoming");
         assert_eq!(Incoming::parse("pdf", "pdfcraft:open"), None, "an app id that is only a prefix");

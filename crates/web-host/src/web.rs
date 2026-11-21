@@ -36,8 +36,9 @@ impl FileData {
 
 /// A message from the host.
 pub enum Message {
-    /// What the host supports; `handoff`: it routes files the app hands off.
-    Host { version: String, handoff: bool },
+    /// What the host supports; `handoff`: it routes files the app hands off; `confirms_saves`: it
+    /// answers every save with `saved` or `save-failed` (`host {confirmsSaves: true}`).
+    Host { version: String, handoff: bool, confirms_saves: bool },
     /// Open a document as File › Open would. `name` is already cleaned ([`crate::file_name`]).
     Open { name: String, data: FileData },
     /// Attach one PDF page to the current drawing without opening another document.
@@ -45,6 +46,9 @@ pub enum Message {
     AttachPdf { name: String, bytes: js_sys::Uint8Array, page: u32, insertion: [f64; 3], width: f64, height: f64 },
     /// The save with this `id` is stored.
     Saved { id: String },
+    /// The host refused the save with this `id` (`save-failed`). `error` is the host's free text,
+    /// meant to be shown to the person as it is; an empty one still says the save did not happen.
+    SaveFailed { id: String, error: String },
     /// The host gave a handed-off file to the app that edits it.
     HandoffDone { name: String, app: String },
 }
@@ -150,8 +154,10 @@ impl Host {
     }
 
     /// Hand the host a file the app would otherwise download: Save, Save As, Export. With an
-    /// `id`, the host answers [`Message::Saved`] once it is stored; without one the save is done
-    /// once it is posted. The bytes go as a transferred `ArrayBuffer`.
+    /// `id`, the host answers [`Message::Saved`] or [`Message::SaveFailed`] once it has stored or
+    /// refused it; without one the save is done once it is posted. When the host set
+    /// `confirmsSaves` in its [`Message::Host`], every save carries an `id`. The bytes go as a
+    /// transferred `ArrayBuffer`.
     pub fn post_save(&self, name: &str, bytes: &[u8], id: Option<&str>, save_as: bool) -> Result<(), String> {
         let buffer = js_sys::Uint8Array::from(bytes).buffer();
         let mut fields =
@@ -207,6 +213,7 @@ fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
         Incoming::Host => Message::Host {
             version: string(data, "version").unwrap_or_else(|| VERSION.to_string()),
             handoff: get(data, "handoff").as_bool() == Some(true),
+            confirms_saves: get(data, "confirmsSaves").as_bool() == Some(true),
         },
         Incoming::Open => {
             let name = file_name(string(data, "name").as_deref(), "document");
@@ -238,6 +245,11 @@ fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
             }
         }
         Incoming::Saved => Message::Saved { id: string(data, "id")? },
+        Incoming::SaveFailed => Message::SaveFailed {
+            // The `id` is what makes the refusal address a save; the text may be empty.
+            id: string(data, "id")?,
+            error: string(data, "error").unwrap_or_default(),
+        },
         Incoming::HandoffDone => {
             Message::HandoffDone { name: string(data, "name").unwrap_or_default(), app: string(data, "app").unwrap_or_default() }
         }
@@ -440,14 +452,39 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn a_save_failed_needs_a_string_id_and_keeps_its_text() {
+        assert!(matches!(
+            read(Incoming::SaveFailed, &obj(&[("id", "s1".into()), ("error", "someone else saved this file".into())])),
+            Some(Message::SaveFailed { id, error }) if id == "s1" && error == "someone else saved this file"
+        ));
+        // An empty refusal still says the save did not happen.
+        assert!(matches!(
+            read(Incoming::SaveFailed, &obj(&[("id", "s1".into())])),
+            Some(Message::SaveFailed { id, error }) if id == "s1" && error.is_empty()
+        ));
+        // Without an `id` the refusal addresses no save and is dropped.
+        for data in [obj(&[("error", "no write access".into())]), obj(&[("id", 3.into())]), JsValue::NULL, JsValue::from_str("s1")] {
+            assert!(read(Incoming::SaveFailed, &data).is_none());
+        }
+    }
+
+    #[wasm_bindgen_test]
     fn a_host_message_and_a_handoff_done_read_whatever_fields_exist() {
-        // Nothing required: a missing version is the contract's, `handoff` is true only for `true`.
-        for data in [JsValue::NULL, obj(&[]), obj(&[("handoff", "yes".into())]), obj(&[("handoff", 1.into())])] {
-            let Some(Message::Host { version, handoff }) = read(Incoming::Host, &data) else { panic!("a host message is read") };
+        // Nothing required: a missing version is the contract's, `handoff` and `confirmsSaves` are
+        // true only for `true`.
+        for data in
+            [JsValue::NULL, obj(&[]), obj(&[("handoff", "yes".into())]), obj(&[("handoff", 1.into())]), obj(&[("confirmsSaves", "true".into())])]
+        {
+            let Some(Message::Host { version, handoff, confirms_saves }) = read(Incoming::Host, &data) else { panic!("a host message is read") };
             assert_eq!(version, crate::VERSION);
             assert!(!handoff);
+            assert!(!confirms_saves, "a host confirms saves only when it says `true`");
         }
-        assert!(matches!(read(Incoming::Host, &obj(&[("handoff", true.into())])), Some(Message::Host { handoff: true, .. })));
+        assert!(matches!(read(Incoming::Host, &obj(&[("handoff", true.into())])), Some(Message::Host { handoff: true, confirms_saves: false, .. })));
+        assert!(matches!(
+            read(Incoming::Host, &obj(&[("confirmsSaves", true.into())])),
+            Some(Message::Host { handoff: false, confirms_saves: true, .. })
+        ));
         assert!(matches!(
             read(Incoming::HandoffDone, &obj(&[("name", "a.pdf".into()), ("app", "pdfcraft".into())])),
             Some(Message::HandoffDone { name, app }) if name == "a.pdf" && app == "pdfcraft"
